@@ -2,8 +2,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 import math
 # own functions
-from brier_score import KM_CensoringDistribution
-from brier_score import CompRiskMetricsCompute
+from metrics.score import KM_CensoringDistribution
+from metrics.score import CompRiskMetricsCompute
 # sksurv
 from sksurv.metrics import integrated_brier_score
 from sksurv.util import Surv
@@ -186,7 +186,7 @@ if __name__ == "__main__":
     tau = 5 
 
     out = weighted_brier_score(pred, tau, time, status, cause, cens_code=0, cmprsk=True)
-    print(out)
+    print(out) # get the same result as in R 
 
     ### testing for a matrix with a Cif per patient:
     dis, bmt_df = load_bmt()
