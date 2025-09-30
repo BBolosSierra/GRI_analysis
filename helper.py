@@ -129,67 +129,108 @@ def transform_with_preprocessor(X: pd.DataFrame, pre: dict):
     Xnz = pre["nzv"].transform(X_comb) if X_comb.size else X_comb
     return Xnz
 
-
 ### Dataset generation ###
-def synthetic_censoring_times(n=1000, lam_event=0.3, lam_cens=0.2, rng=42):
-    """ T ~ Exp(lam_event), C ~ Exp(lamb_cens)
-    The observed time = min(T, C). 
-    Event indicator depends on the observed time. """
+def sim_cmprks(n=30000,
+               p_block=4,
+               gammas=10,         # scalar or length-p_block array-like
+               cens_frac=0.5,
+               seed=123):
+    """
+    Competing risks simulator akin to the R version (DeepHit-like).
     
-    rng= np.random.default_rng(rng)
+    Returns a DataFrame with columns:
+      Tobs, status (1=event, 0=censored), cause (0=censored, 1 or 2=event type),
+      x1_1..x1_p, x2_1..x2_p, x3_1..x3_p
+    """
 
-    T = rng.exponential(scale=1/lam_event, size=n)
-    C = rng.exponential(scale=1/lam_cens, size=n)
-    
-    T = np.asarray(T, dtype=float)
-    C = np.asarray(C, dtype=float)
+    rng = np.random.default_rng(seed)
 
-    Tobs = np.minimum(T, C)
-    delta = np.where(T <= C, 1, 0).astype(int)
-    return Tobs, delta
+    # gamma vectors
+    if np.isscalar(gammas):
+        gamma1 = np.repeat(gammas, p_block).astype(float)
+        gamma2 = np.repeat(gammas, p_block).astype(float)
+        gamma3 = np.repeat(gammas, p_block).astype(float)
+    else:
+        g = np.asarray(gammas, dtype=float)
+        if g.size != p_block:
+            raise ValueError("gammas must be scalar or length p_block.")
+        gamma1 = g.copy()
+        gamma2 = g.copy()
+        gamma3 = g.copy()
 
+    # covariates (n x p_block)
+    x1 = rng.normal(size=(n, p_block))
+    x2 = rng.normal(size=(n, p_block))
+    x3 = rng.normal(size=(n, p_block))
 
-def sim_cmprsk_dataset(n, lambda1, lambda2, lambda_c, rng):
-    # only times and no covariates based on exponen
-    #  T1 ~ Exp(l1), T2 ~ Exp(l2), C ~ Exp(lc)
-    rng= np.random.default_rng(rng)
+    # linear effects
+    g1_x1 = x1 @ gamma1
+    g2_x2 = x2 @ gamma2
+    g3_x3 = x3 @ gamma3
 
-    T1 = rng.exponential(1/lambda1, size=n)
-    T2 = rng.exponential(1/lambda2, size=n)
-    C  = rng.exponential(1/lambda_c, size=n)
-    # observed time and type
-    T  = np.minimum(np.minimum(T1, T2), C)
-    D  = np.where((T1 < T2) & (T1 < C), 1,
-         np.where((T2 < T1) & (T2 < C), 2, 0)).astype(int)
-    
-    return T, D
+    # quadratic effects & rates
+    lambda1 = np.exp(g3_x3**2 + g1_x1)
+    lambda2 = np.exp(g3_x3**2 + g2_x2)
 
-def cif_cmprsk_data(n_train, n_val, lambda1, lambda2, lambda_c):
-    # generate simple dataset without covariates
-    T_train, D_train = sim_cmprsk_dataset(n_train, lambda1, lambda2, lambda_c)
-    T_val,   D_val   = sim_cmprsk_dataset(n_val, lambda1, lambda2, lambda_c)
-    
-    # but double check this:
-    # S(t) = exp(-(l1+l2)t), F1(t) = (l1/(l1+l2))*(1 - S), 
-    # F2(t) = (l2/(l1+l2))*(1 - S).
-    time_grid = np.linspace(0.1, 10.0, 50)
-    S = np.exp(-(lambda1+lambda2)*time_grid) # survival
-    F1_true = (lambda1/(lambda1+lambda2))*(1 - S) # cif cause 1
-    F2_true = (lambda2/(lambda1+lambda2))*(1 - S) # cif cause 2
+    # hitting times: rexp(rate=lambda) -> exponential with scale=1/lambda
+    T1 = rng.exponential(scale=1.0 / lambda1)
+    T2 = rng.exponential(scale=1.0 / lambda2)
+    si = np.minimum(T1, T2)
 
-    # cifs as a matrix (here all patients)
-    pred_cif_val_c1 = np.tile(F1_true, (T_val.size, 1))
-    pred_cif_val_c2 = np.tile(F2_true, (T_val.size, 1))
+    # censoring times
+    sc = np.full(n, np.inf, dtype=float)
+    if cens_frac > 0.0:
+        m = np.floor(cens_frac * n)
+        if m > 0:
+            cens_idx = rng.choice(n, size=m, replace=False)
+            # Uniform(0, si[i]) for selected i
+            sc[cens_idx] = rng.random(size=m) * si[cens_idx]
 
-    return T_train, D_train, T_val, D_val, pred_cif_val_c1, pred_cif_val_c2, time_grid
-    
+    # observed time and cause
+    Tobs = np.minimum(np.minimum(T1, T2), sc)
+
+    is_cens = sc <= si          
+    uncens = ~is_cens
+
+    c1 = np.zeros(n, dtype=bool)
+    c2 = np.zeros(n, dtype=bool)
+
+    # compare only among uncensored
+    c1[uncens] = T1[uncens] < T2[uncens]
+    c2[uncens] = T2[uncens] < T1[uncens]
+    tie_mask = uncens & ~(c1 | c2)
+
+    cause = np.zeros(n, dtype=int)
+    cause[c1] = 1
+    cause[c2] = 2
+    if np.any(tie_mask):
+        # randomize ties between {1,2}
+        cause[tie_mask] = rng.choice([1, 2], size=tie_mask.sum(), replace=True)
+
+    status = (cause != 0).astype(int)
+
+    # build DataFrame with matching column names
+    df = pd.DataFrame({
+        "Tobs": Tobs.astype(float),
+        "status": status.astype(int),
+        "cause": cause.astype(int),
+    })
+
+    for j in range(p_block):
+        df[f"x1_{j+1}"] = x1[:, j]
+        df[f"x2_{j+1}"] = x2[:, j]
+        df[f"x3_{j+1}"] = x3[:, j]
+
+    return df
 
 ## Estimators and model fitters:
 def km_test():
     cens = KM_CensoringDistribution(eps = 1e-8)
     # create synthetic dataset
-    Tobs, delta = synthetic_censoring_times(n=2000, lam_event=0.3, lam_cens=0.2)
-    print(Tobs)
+    df = sim_cmprks(n=30000, p_block=4, gammas=10, cens_frac=0.5, seed=123) 
+
+    Tobs = df["Tobs"]
+    delta = df["cause"]
 
     cens.fit(Tobs, delta) # fitting the Censoring Distribution
 
@@ -274,4 +315,110 @@ def cifs_from_cs_hazards(L1, L2):
         S = S * np.exp(-dlt)
     # clip numerically to [0,1]
     return np.clip(F1, 0, 1), np.clip(F2, 0, 1)
+
+
+''' This block corresponds with translations from my R package
+To check if the function was working I use the LumcData, based on the
+splits, risk was predicted with the riskRegression cause-specific 
+cox PH in R ato be loaded directly for straightforward comparison.
+The prediction is simply the risk at a specific time point or horizon 
+of interest and we evaluate at that same time (tau). 
+
+Therefore this implmentation is a simplification of the problem, where the
+goal is to have a weighted brier score that adjust for censoring, but also 
+can allow competing risks. 
+We ultise lifelines for estimating the Kaplan Meier of the censoring 
+distribution.
+
+With this test we get the same results as in riskregression in R and my 
+own functions in R '''
+
+def read_lumc():
+    # read the two RDS files from R
+    rdata = pyreadr.read_r("metrics/LumcData/rdata.rds")[None]  # a pandas.DataFrame
+    vdata = pyreadr.read_r("metrics/LumcData/vdata.rds")[None]
+
+    # predictions done in R with riskRegression Cause-Specific hazards for cause 1
+    vdata_pred = pyreadr.read_r("metrics/LumcData/vdata_CSC_pred.rds")[None]
+
+    return rdata, vdata, vdata_pred
+
+def censor_prob_KM(time, status, cens_code=0, step=0.1, eps=0.01, left_limit=True):
+
+    time   = np.asarray(time, float)
+    status = np.asarray(status, int)
+
+    # Fit KM for censoring: event_observed=1 indicates censoring occurred
+    km = KaplanMeierFitter().fit(durations=time, event_observed=(status == cens_code).astype(int))
+
+    # Raw step function from lifelines
+    tt = km.survival_function_.index.to_numpy(float)                    # jump times including 0
+    gg = km.survival_function_["KM_estimate"].to_numpy(float)           # step values
+
+    # Build regular grid
+    tmax = math.floor(float(np.max(time)))
+    time_grid = np.arange(0.0, tmax + step/2, step)                     # inclusive of tmax
+
+    # Left-limit lookup: last value strictly before t
+    if left_limit:
+        idx = np.searchsorted(tt, time_grid, side="right") - 1
+        idx = np.clip(idx, 0, len(gg)-1)
+        G = gg[idx]
+    else:
+        # right-continuous value at t
+        idx = np.searchsorted(tt, time_grid, side="left")
+        idx = np.clip(idx, 0, len(gg)-1)
+        G = gg[idx]
+
+    # Ensure monotone and clip away from zero
+    G = np.minimum.accumulate(G)                    # safety; KM should be nonincreasing
+    G = np.clip(G, eps, 1.0)
+
+    return np.column_stack([time_grid, G])
+
+def weighted_brier_score(pred, tau, time, status, cause, cens_code=0, cmprsk=True, eps=0.01):
+    # as in Albergue 2025 (who set it from Kretowska 2018)
+    time = np.asarray(time, float)
+    status = np.asarray(status, int)
+    pred = np.asarray(pred, float)  # prediction at tau
+
+    Gtbl = censor_prob_KM(time, status, cens_code=cens_code)
+    tG, Gv = Gtbl[:,0], Gtbl[:,1]
+
+    def G_left(x):   # G(T-) : last grid point strictly < Ti
+        i = np.searchsorted(tG, float(x), side="right") - 1
+        i = 0 if i < 0 else (len(Gv) - 1 if i >= len(Gv) else i)
+        return float(Gv[i])
+
+    def G_right(x):  # G(t+) ≈ right-continuous value at/after t
+        i = np.searchsorted(tG, float(x), side="left")
+        i = len(Gv) - 1 if i >= len(Gv) else i
+        return float(Gv[i])
+
+    # G1 = G(T_i-), G2 = G(t+)
+    G1 = np.clip(np.array([G_left(ti) for ti in time]), eps, 1.0)
+    G2 = np.clip(G_right(float(tau)), eps, 1.0)
+
+    alive_after_tau = (time > tau)
+    evt_interest    = (time <= tau) & (status == cause)
+    evt_other       = (time <= tau) & (status != cause) & (status != cens_code)
+    cens_before_tau = (time <= tau) & (status == cens_code)
+
+    if cmprsk:
+        resid = np.zeros_like(pred, float)
+        resid[evt_interest]  = ((1.0 - pred[evt_interest])**2) / G1[evt_interest]
+        resid[evt_other]     = (pred[evt_other]**2)            / G1[evt_other]
+        resid[cens_before_tau]= 0.0
+        resid[alive_after_tau]= (pred[alive_after_tau]**2)     / G2
+    else:
+        resid = np.zeros_like(pred, float)
+        resid[(time <= tau) & (status == cause)] = ((1.0 - pred[(time <= tau) & (status == cause)])**2) / G1[(time <= tau) & (status == cause)]
+        resid[(time <= tau) & (status == cens_code)] = 0.0
+        resid[alive_after_tau] = (pred[alive_after_tau]**2) / G2
+
+    return dict(weighted_brier_score=float(np.mean(resid)),
+                tau=float(tau),
+                n=int(len(pred)),
+                n_risk=int(np.sum(alive_after_tau)))
+
 
