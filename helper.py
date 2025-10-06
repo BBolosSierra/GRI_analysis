@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import math
+import re 
 # own functions
 from metrics.score import KM_CensoringDistribution
 from metrics.score import CompRiskMetricsCompute
@@ -24,9 +25,32 @@ import pyreadr
 from lifelines import KaplanMeierFitter
 
 #### For preprocessing ####
-def smart_fix_dtypes(df, cat_threshold=20):
+def clean_columns(df, drop_names=("pete")):
+
+    drop_names = {n.lower() for n in drop_names}
+    old_cols = list(df.columns)
+    new_cols = list()
+
+    for s in old_cols:
+        s = s.strip()
+        s = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", s)
+
+        s = re.sub(r"[^\w]+", "_", s)
+        s = re.sub(r"_+", "_", s)      
+        s = s.strip("_").lower()
+        
+        parts = [p for p in s.split("_") if p and p not in drop_names]
+        s = "_".join(parts)
+        
+        s = re.sub(r"_+", "_", s).strip("_")
+
+        new_cols.append(s)
+    
+    return new_cols
+
+def smart_fix_dtypes(df, cat_threshold=10):
     df = df.copy()
-    # A) floats that are 0/1 → boolean
+    # A) floats that are 0/1 to boolean
     mask_bool = {
         c for c in df.columns
         if pd.api.types.is_float_dtype(df[c]) and set(df[c].dropna().unique()).issubset({0,1})
@@ -34,13 +58,13 @@ def smart_fix_dtypes(df, cat_threshold=20):
     for c in mask_bool:
         df[c] = df[c].astype("Int64").map({0: False, 1: True}).astype("boolean")
 
-    # B) object numeric strings → numeric
+    # B) object numeric strings to numeric
     for c in df.select_dtypes(include="object").columns:
         frac_num = df[c].astype("string").str.match(r"^\s*-?\d+(\.\d+)?\s*$", na=False).mean()
         if frac_num > 0.9:
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    # C) low-cardinality numerics → category
+    # C) low-cardinality numerics to category
     for c in df.columns:
         s = df[c]
         nun = s.nunique(dropna=True)
