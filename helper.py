@@ -23,59 +23,94 @@ from sklearn.feature_selection import VarianceThreshold
 # to look at r data
 import pyreadr
 from lifelines import KaplanMeierFitter
+# for dtypes
+from pandas.api.types import (
+    is_bool_dtype, is_string_dtype, is_object_dtype,
+    is_categorical_dtype, is_numeric_dtype
+)
+# is_categorical_dtype being deprecated
+from pandas import CategoricalDtype
 
 #### For preprocessing ####
-def clean_columns(df, drop_names=("pete")):
-
-    drop_names = {n.lower() for n in drop_names}
-    old_cols = list(df.columns)
-    new_cols = list()
-
-    for s in old_cols:
-        s = s.strip()
-        s = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", s)
-
+def clean_columns(df, drop=("pete","jen"), lower=True):
+    drop = {str(x).lower() for x in drop}
+    camel = re.compile(r"([a-z0-9])([A-Z])")
+    def norm(s):
+        s = camel.sub(r"\1_\2", str(s).strip())
         s = re.sub(r"[^\w]+", "_", s)
-        s = re.sub(r"_+", "_", s)      
-        s = s.strip("_").lower()
-        
-        parts = [p for p in s.split("_") if p and p not in drop_names]
-        s = "_".join(parts)
-        
-        s = re.sub(r"_+", "_", s).strip("_")
-
-        new_cols.append(s)
-    
-    return new_cols
+        s = s.lower() if lower else s
+        parts = [p for p in s.strip("_").split("_") if p and p.lower() not in drop]
+        return re.sub(r"_+", "_", "_".join(parts)).strip("_")
+    return df.rename(columns=norm)
 
 def smart_fix_dtypes(df, cat_threshold=10):
     df = df.copy()
-    # A) floats that are 0/1 to boolean
-    mask_bool = {
-        c for c in df.columns
-        if pd.api.types.is_float_dtype(df[c]) and set(df[c].dropna().unique()).issubset({0,1})
-    }
-    for c in mask_bool:
-        df[c] = df[c].astype("Int64").map({0: False, 1: True}).astype("boolean")
+    bin_cols = set()
 
-    # B) object numeric strings to numeric
-    for c in df.select_dtypes(include="object").columns:
-        frac_num = df[c].astype("string").str.match(r"^\s*-?\d+(\.\d+)?\s*$", na=False).mean()
-        if frac_num > 0.9:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-
-    # C) low-cardinality numerics to category
+    # 1) Normalize any True/False (bool, string, categorical-of-string) -> Int8 {0,1,NA}
     for c in df.columns:
         s = df[c]
+        if is_bool_dtype(s):
+            df[c] = s.map({False: 0, True: 1}).astype("Int8")
+            bin_cols.add(c)
+            continue
+
+        if isinstance(s.dtype, CategoricalDtype):
+            cats = pd.Series(s.cat.categories, dtype="string").dropna().unique()
+            if set(cats).issubset({"True", "False"}):
+                df[c] = s.astype("string").map({"False": 0, "True": 1}).astype("Int8")
+                bin_cols.add(c)
+                continue
+
+        if is_string_dtype(s) or is_object_dtype(s):
+            vals = pd.Series(s.dropna().unique()).astype("string").str.strip().str.lower()
+            if set(vals).issubset({"true", "false", "0", "1"}):
+                mapping = {"false": 0, "true": 1, "0": 0, "1": 1}
+                df[c] = s.astype("string").str.strip().str.lower().map(mapping).astype("Int8")
+                bin_cols.add(c)
+                continue
+
+    # 2) object numerics -> numeric
+    for c in df.select_dtypes(include="object").columns:
+        s = df[c].astype("string")
+        is_num = s.str.match(r"^\s*-?\d+(\.\d+)?\s*$", na=False)
+        if is_num.mean() > 0.9:
+            df[c] = pd.to_numeric(s, errors="coerce")
+
+    # 3) low-cardinality numerics -> category (EXCLUDE binaries)
+    for c in df.columns:
+        if c in bin_cols:
+            continue
+        s = df[c]
+        if not is_numeric_dtype(s):
+            continue
         nun = s.nunique(dropna=True)
-        if nun <= cat_threshold and (pd.api.types.is_integer_dtype(s) or pd.api.types.is_float_dtype(s)):
+        if 2 < nun <= cat_threshold:
             if pd.api.types.is_float_dtype(s) and (s.dropna() == s.dropna().round()).all():
                 df[c] = s.round().astype("Int64").astype("category")
             else:
-                df[c] = s.astype("string").astype("category")
-        elif pd.api.types.is_object_dtype(s) and nun <= 50:
+                df[c] = s.astype("Int64").astype("category")
+
+    # 4) low-cardinality strings/objects -> category (binaries already removed)
+    for c in df.columns:
+        if c in bin_cols:
+            continue
+        s = df[c]
+        if (is_object_dtype(s) or is_string_dtype(s)) and s.nunique(dropna=True) <= 50:
             df[c] = s.astype("string").str.strip().astype("category")
+
+    for c in df.select_dtypes(include=["number"]).columns:
+        s = df[c]
+        uniq = pd.Series(s.dropna().unique())
+        if uniq.nunique() == 2:
+            # ensure sorted order 0/1
+            uniq_sorted = sorted(uniq)
+            mapping = {uniq_sorted[0]: 0, uniq_sorted[1]: 1}
+            df[c] = s.map(mapping).astype("Int8")
+            bin_cols.add(c)
+
     return df
+
 
 def split_num_cat(X: pd.DataFrame):
     num_cols = X.select_dtypes(include=[np.number]).columns.tolist()
