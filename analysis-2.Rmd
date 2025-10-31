@@ -1,0 +1,757 @@
+---
+title: "analysis-2.rmd"
+output: html_document
+date: "2025-10-28"
+---
+
+## Analysis 2 for GRI
+
+The preprocess-1.ipynb and analysis-1.ipynb preceed this analysis.
+The previous files are used for the data and metadata generation in python. 
+In this file, some inital steps for the analysis are carried out in R, since traditionally survival analysis is done in R, the resources are richer. 
+
+
+Load the data generated in python
+
+```{r}
+library(dplyr)
+library(tidyr)
+```
+
+```{r}
+
+df = read.csv("data/GRI_preprocess-2.csv", na.strings = "")
+
+rownames(df) = df$TMA_order
+
+df = df[, !(names(df) %in% c("TMA_order"))]
+
+df = df[, !(names(df)) %in% c("X")]
+
+```
+
+```{r}
+binary <- c('Emergency_Surgery', 'Sex', 'Tumour_Budding',
+       'Tumour_Perforation', 'Margin_Invasion', 'Venous_Invasion',
+       'Peritoneal_Invasion', 'IL6R_AK_186_64', 'ZEB1_Nuclear',
+       'Twist_Cytoplasmic', 'Twist_Nuclear', 'Snail_Cytoplasmic',
+       'Snail_Nuclear', 'SOX9_Cytoplasmic', 'SOX9_Nuclear', 'ZEB1_Cytoplasmic',
+       'BudCohort_ZEB1_Cytoplasmic_A', 'BudCohort_ZEB1_Nuclear',
+       'IL17RA_Presence', 'BRAF', 'KRAS', 'NRAS')
+
+```
+
+```{r}
+cat <- c('MMR_Status', 'Tumour_Location', 'T_Stage', 'N_Stage',
+       'Histological_Grade', 'Elastica_Venous_Invasion')
+```
+
+```{r}
+# transform to factors
+df[binary] <- lapply(df[binary], as.factor)
+df[cat] <- lapply(df[cat], as.factor)
+```
+
+
+
+### Descriptive statistics
+
+```{r}
+library(gtsummary)
+
+summary_table <- df %>% 
+tbl_summary(
+  by = Cmprsk_Status,
+  statistic = list(all_continuous() ~ "{mean} ({sd})",
+                   all_categorical() ~ "{n} ({p}%)"
+))
+
+# latex
+latex_code <- summary_table %>%
+  as_kable(format = "latex", booktabs = TRUE, caption = "Summary Table by Overall Survival Status", label = "tab:summary")
+
+
+```
+
+```{r}
+summary_table
+```
+
+
+## Kaplan Meier curves
+
+The competing risk is going to be censored, we are overestimating the event of interest incidence by using Kaplan-Meier.
+
+```{r}
+library(survival)
+library(survminer)
+library(ggplot2)
+```
+
+```{r, fig.height=5, fig.weight=7}
+
+SurvObj <- with(df, Surv(time = Disease_Free_Survival_Months, event = Cmprsk_Status == 1))
+
+fit_sex <- survfit(SurvObj ~ Sex, data = df)
+
+summary(fit_sex)
+
+survdiff(SurvObj ~ Sex, data = df)
+
+ggsurvplot(fit_sex, data = df,
+           pval = TRUE,
+           conf.int = TRUE,
+           risk.table = TRUE,
+           ggtheme = theme_minimal(),
+           title = "Kaplan–Meier by Sex")
+```
+
+Do the same for all variables
+
+We are clearly considering competing risks as censored and performing normal survival analysis:
+
+```{r}
+table(df$Histological_Grade, useNA = 'ifany')
+```
+
+
+```{r, fig.height=5, fig.weight=7}
+
+# time_col   <- "Disease_Free_Survival_Months"
+# status_col <- "Cmprsk_Status"
+# 
+# cat_vars <- names(df)[sapply(df, \(x) is.factor(x) || is.character(x))]
+# cat_vars <- setdiff(cat_vars, c(time_col, status_col))
+# 
+# for (v in cat_vars) {
+#   dat <- df[, c(time_col, status_col, v)]
+# 
+#   # make explicit columns so no symbols are looked up
+#   dat$time  <- dat[[time_col]]
+#   dat$event <- dat[[status_col]] == 1
+#   dat$grp   <- droplevels(dat[[v]])
+# 
+#   fit <- survfit(Surv(time, event) ~ grp, data = dat)
+# 
+#   pl <- ggsurvplot(
+#     fit, data = dat,
+#     pval = TRUE, conf.int = TRUE, risk.table = TRUE,
+#     ggtheme = theme_minimal(), title = paste("KM by", v), legend.title = v
+#   )
+# 
+#   print(pl)
+# }
+
+```
+
+```{r}
+# for (v in cat_vars) {
+#   dat <- df[, c(time_col, status_col, v)]
+#   dat$time  <- dat[[time_col]]
+#   dat$status <- dat[[status_col]]
+#   dat$grp   <- droplevels(dat[[v]])
+# 
+#   ci <- cmprsk::cuminc(
+#     ftime   = dat$time,
+#     fstatus = dat$status,
+#     group   = dat$grp
+#   )
+# 
+#   plot(ci, wh = 1, main = paste0(v, " Cumulative incidence (cause 1)"), xlab = "Time (months)",
+#      ylab = "Probability", lty=1:length(ci), color=1, lwd=par('lwd'),)
+# 
+# }
+```
+
+
+```{r  fig.height=5, fig.weight=7}
+library(tidycmprsk)
+library(ggplot2)
+library(ggsurvfit)
+library(cmprsk)
+
+time_col   <- "Disease_Free_Survival_Months"
+status_col <- "Cmprsk_Status"
+
+df2 <- df %>%
+  mutate(
+    !!status_col := factor(
+      .data[[status_col]],
+      levels = c(0, 1, 2), 
+      labels = c("censor", "death from cancer", "death other causes")
+    )
+  ) %>%
+  filter(is.finite(.data[[time_col]]), !is.na(.data[[status_col]]))
+
+outcomes_present <- setdiff(levels(df2[[status_col]]), "censor")
+cause_labels <- c("death from cancer", "death other causes")
+
+grp_var <- "Sex"
+df2[[grp_var]] <- factor(df2[[grp_var]])
+
+f <- as.formula(paste0("Surv(", time_col, ", ", status_col, ") ~ ", grp_var))
+
+ci_obj <- tidycmprsk::cuminc(f, data = df2)
+
+pvals <- ci_obj$cmprsk$Tests[, "pv"] 
+subtitle_txt <- paste(paste0(cause_labels, ": p=", signif(pvals, 3)), collapse = "   ")
+
+p <- ggsurvfit::ggcuminc(ci_obj, outcome = c("death from cancer", "death other causes")) +
+  add_confidence_interval() +
+  add_risktable() +
+  scale_ggsurvfit() +
+  labs(
+    title = paste("Cumulative incidence by", grp_var),
+    subtitle = subtitle_txt,
+    x = "Time (months)",
+    y = "Cumulative incidence"
+  )
+
+print(p)
+
+```
+
+Let's perform this with all categoricals: 
+
+
+```{r fig.height=5, fig.weight=7}
+time_col   <- "Disease_Free_Survival_Months"
+status_col <- "Cmprsk_Status"
+
+df2 <- df %>%
+  mutate(
+    !!status_col := factor(
+      .data[[status_col]],
+      levels = c(0, 1, 2), 
+      labels = c("censor", "death CRC/recurrence", "death other causes")
+    )
+  ) %>%
+  filter(is.finite(.data[[time_col]]), !is.na(.data[[status_col]]))
+
+outcomes_present <- setdiff(levels(df2[[status_col]]), "censor")
+cause_labels <- c("death CRC/recurrence", "death other causes")
+
+cat_vars <- names(df2)[vapply(df2, function(x) is.factor(x) || is.character(x) || is.logical(x), TRUE)]
+cat_vars <- setdiff(cat_vars, c(time_col, status_col))
+
+
+for (v in cat_vars) {
+
+  f <- as.formula(paste0("Surv(", time_col, ", ", status_col, ") ~ ", v))
+  
+  ci_obj <- tidycmprsk::cuminc(f, data = df2)
+  
+  pvals <- ci_obj$cmprsk$Tests[, "pv"] 
+  subtitle_txt <- paste(paste0(cause_labels, ": p=", signif(pvals, 3)), 
+                        collapse = "   ")
+  
+  p <- ggcuminc(ci_obj, outcome = "death CRC/recurrence")+
+    add_confidence_interval() +
+    add_risktable() +
+    scale_ggsurvfit() +
+    labs(
+      title = paste("Cumulative incidence by", v),
+      subtitle = subtitle_txt,
+      x = "Time (months)",
+      y = "Cumulative incidence"
+    )
+
+  print(p)
+}
+```
+
+### bring the coded variables... ? 
+
+
+### Simple train/test split to test addition of covariates:
+
+
+```{r}
+library(recipes)
+library(rsample)
+library(survival)
+library(cmprsk)
+library(broom)
+```
+
+```{r}
+set.seed(123)
+
+rownames(df) <- df$TMA_Order
+
+df <- df[, !(names(df) %in% c("TMA_Order"))]
+
+time_col   <- "Disease_Free_Survival_Months"
+status_col <- "Cmprsk_Status"
+
+predictors <- setdiff(names(df), c(time_col, status_col))
+
+predictors
+```
+
+
+```{r}
+set.seed(42)
+
+split <- initial_split(df, prop = 0.7, strata = all_of(status_col))
+train <- training(split)
+test  <- testing(split)
+
+# imputation to be applied to train
+
+rx <- recipe(reformulate(predictors, response = time_col), data = train) %>%
+  # the outcome as time
+  update_role(all_of(time_col), new_role = "outcome") %>%
+  # the predictor is all the rest
+  update_role(all_of(setdiff(predictors, time_col)), new_role = "predictor") %>%
+  # median and mode
+  step_impute_median(all_numeric_predictors()) %>%
+  step_impute_mode(all_nominal_predictors()) %>%
+  step_zv(all_predictors()) %>%
+  # normalise the continuous
+  step_normalize(all_numeric_predictors(), -all_outcomes())
+  
+# imputation and scaling only from the training
+rx_prep <- prep(rx, training = train, verbose = FALSE)
+
+X_train <- bake(rx_prep, new_data = train) %>% select(-all_of(time_col))
+X_test  <- bake(rx_prep, new_data = test)  %>% select(-all_of(time_col))
+
+ftime_train   <- train[[time_col]]
+fstatus_train <- train[[status_col]]
+
+ftime_test    <- test[[time_col]]
+fstatus_test  <- test[[status_col]]
+
+```
+
+
+Avoid collinearity:
+
+```{r}
+causes <- sort(setdiff(unique(fstatus_train), 0))
+
+form_all <- as.formula(paste0("~ ", paste(colnames(X_train), collapse = " + ")))
+MM <- model.matrix(form_all, data = X_train)[, -1, drop = FALSE]
+
+# avoiding collinearity:
+# but how has it been introduced? 
+qrX <- qr(MM)
+keep <- sort(qrX$pivot[seq_len(qrX$rank)])
+predictors_train <- MM[, keep, drop = FALSE]
+
+dif <- setdiff(colnames(MM), colnames(predictors_train))
+
+dif
+```
+
+```{r}
+# cor(train$Preoperative_CRP, train$CRP,
+#   method = "spearman"
+# )
+# 
+# cor(train$Preoperative_Lymphocytes, train$Lymphocytes,
+#   method = "spearman"
+# )
+
+```
+```{r}
+plot(train$PTPN12_Tumour, train$PTPN12_Stroma)
+
+cor(train$PTPN12_Tumour, train$PTPN12_Stroma, method = "spearman")
+```
+```{r}
+#plot(log(train$Ki67_Image_Analysis), log(train$Ki67_Tumour))
+```
+```{r}
+#plot(train$CD3FOXP3_Raw, train$CD3_FOXP3_Raw)
+```
+```{r}
+#cor(train$CD3FOXP3_Raw, train$CD3_FOXP3_Raw, use="complete.obs")
+```
+
+```{r}
+#plot(train$Preoperative_CRP, train$CRP)
+```
+
+```{r}
+#plot(train$Preoperative_Lymphocytes, train$Lymphocytes)
+
+```
+
+
+## Missigness
+
+```{r, fig.height=8}
+library(naniar)
+
+gg_miss_var(df, show_pct = TRUE)
+
+
+```
+
+## Correlation
+
+```{r, fig.height=8}
+library(reshape2)
+
+num <- df %>%
+  select(where(is.numeric))
+
+corr <- stats::cor(num, use = "pairwise.complete.obs", method = "spearman")
+melted <- melt(corr)
+
+ggplot(melted, aes(Var1, Var2, fill = value)) +
+  geom_tile() +
+  scale_fill_gradient2(
+    low = "blue", mid = "white", high = "red",
+    midpoint = 0, name = "Spearman ρ"
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
+  coord_fixed() +
+  labs(title = "Correlation matrix (numeric covariates)", x = NULL, y = NULL)
+```
+
+SDMA and Beta Catenines might require selection. 
+
+
+## Class imbalance
+
+```{r, fig.height=8}
+library(forcats)
+
+df_long <- df %>%
+  select(where(\(x) is.factor(x) || is.character(x))) %>%
+  pivot_longer(cols = everything(), names_to = "variable", values_to = "value") %>%
+  mutate(value = fct_explicit_na(as.factor(value), "NA"))
+
+df_plot <- df_long %>%
+  count(variable, value) %>%
+  group_by(variable) %>%
+  mutate(prop = n / sum(n))
+
+ggplot(df_plot, aes(x = value, y = prop, fill = value)) +
+  geom_col() +
+  facet_wrap(~ variable, scales = "free_x") +
+  geom_text(aes(label = scales::percent(prop, accuracy = 0.1)),
+            vjust = -0.3, size = 2.8) +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_brewer(palette = "Set3", na.value = "grey80") +
+  labs(x = NULL, y = "Proportion", title = "Class imbalance across categorical variables") +
+  theme_minimal(base_size = 10) +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+
+## Continue analysis
+
+We should keep the preoperatives
+```{r}
+library(prodlim)
+## fine and grey with cmprsk
+# fit_fg <- lapply(causes, function(k) {
+#   cmprsk::crr(
+#     ftime   = ftime_train,
+#     fstatus = fstatus_train,
+#     cov1    = predictors_train,
+#     failcode = k,
+#     cencode  = 0
+#   )
+# })
+# names(fit_fg) <- paste0("FG_cause_", causes)
+
+## fine and grey with wrapper from riskregression
+train_df <- cbind.data.frame(
+  time   = ftime_train,
+  status = fstatus_train,
+  as.data.frame(X_train)
+)
+
+predictors <- setdiff(names(train_df), c("time","status"))
+
+frm <- as.formula(paste0("Hist(time, status) ~ ", paste(predictors, collapse = " + ")))
+
+fit_fg <- lapply(causes, function(k) {
+  riskRegression::FGR(frm, data = train_df, cause = k)
+})
+names(fit_fg) <- paste0("FG_cause_", causes)
+
+```
+
+```{r}
+length(predictors)
+```
+
+
+https://pmc.ncbi.nlm.nih.gov/articles/PMC5698744/
+
+```{r, fig.height=8}
+
+fg1 <- fit_fg$FG_cause_1$crrFit
+s   <- summary(fg1)
+tab <- as.data.frame(s$coef)
+colnames(tab) <- make.names(colnames(tab), unique = TRUE)
+
+#beta <- drop(fg1$coef)
+#V    <- fg1$var
+#se   <- sqrt(diag(V))
+#z    <- beta / se
+#pval <- 2 * pnorm(abs(z), lower.tail = FALSE)
+
+HR <- data.frame(
+  term       = rownames(tab),
+  estimate   = tab[["exp.coef."]],
+  conf.low   = exp(tab[["coef"]] - 1.96 * tab[["se.coef."]]),
+  conf.high  = exp(tab[["coef"]] + 1.96 * tab[["se.coef."]]),
+  p.value   = tab[["p.value"]],
+  row.names  = NULL,
+  check.names = FALSE
+)
+
+alpha <- 0.05
+HR$sig <- ifelse(is.na(HR$p.value), "NA", ifelse(HR$p.value < alpha, "p<0.05", "ns"))
+HR$sig <- factor(HR$sig, levels = c("p<0.05", "ns", "NA"))
+
+ggplot(HR, aes(x = estimate, y = reorder(term, estimate), color = HR$sig)) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "grey60") +
+  geom_pointrange(aes(xmin = conf.low, xmax = conf.high), na.rm = TRUE) +
+  scale_x_log10() +
+  scale_color_manual(
+    values = c("p<0.05" = "#D55E00", "ns" = "#555555", "NA" = "#AAAAAA"),
+    name = "Significance"
+  ) +
+  labs(x = "Hazard Ratio (log scale)", y = NULL, title = "Fine–Gray: Cause 1") +
+  theme_bw(12) +
+  theme(legend.position = "right")
+```
+
+
+```{r}
+table(train_df$T_Stage, useNA="ifany")
+```
+
+```{r}
+table(train_df$Tumour_Perforation, useNA="ifany")
+```
+
+```{r}
+library(riskRegression)
+library(prodlim)
+
+# eval times
+times <- quantile(ftime_test, probs = seq(0.1, 0.9, by = 0.05), na.rm = TRUE)
+times <- sort(unique(as.numeric(times)))
+
+X_test <- X_test[, colnames(X_train)]
+
+test_df <- cbind.data.frame(
+  time   = ftime_test,
+  status = fstatus_test,
+  as.data.frame(X_test)
+)
+
+
+cif_fg1 <- predictRisk(fit_fg[["FG_cause_1"]], 
+                       newdata = test_df, times = times)
+
+#cif_fg1
+```
+
+
+```{r}
+sc_fg <- Score(
+  object      = list(FG = fit_fg[["FG_cause_1"]]),
+  formula     = Hist(time, status) ~ 1,
+  data        = test_df,
+  times       = times,
+  metrics     = "Brier",
+  cause       = 1L,
+  cens.model  = "km",
+  summary     = "ibs",
+  split.method = "none"
+)
+```
+
+```{r}
+sc_fg
+```
+```{r}
+
+tail(sc_fg$Brier$score$IBS, 1)
+
+```
+
+
+### Additive performance of routine vs research variables.
+
+```{r}
+meta <- read.csv("data/GRI_preprocess-1-meta.csv", stringsAsFactors = FALSE)
+
+
+routine_vars  <- meta %>% filter(Collection == "routine")
+research_vars <- meta %>% filter(Collection == "research")
+both_vars <- c("Disease_Free_Survival_Months", "Cmprsk_Status", "Lymph_Node_Ratio")
+
+
+rou <- union(routine_vars$New.Data.Item, both_vars)
+
+rou
+
+```
+```{r}
+predictors
+
+```
+
+
+```{r}
+
+res <- union(research_vars$New.Data.Item, both_vars)
+res
+```
+
+```{r}
+both <- intersect(c(union(rou, res)), names(train_df))
+
+both
+```
+
+Using the same splits as before:
+
+```{r}
+library(prodlim)
+
+
+train_df <- cbind.data.frame(
+  time   = ftime_train,
+  status = fstatus_train,
+  as.data.frame(X_train)
+)
+
+#train_df <- train_df[, !(names(train_df) %in% drop_vars)]
+
+
+fit_models <- list()
+for (nm in c("Routine", "Research", "Both")) {
+  predictors <- switch(
+    nm,
+    "Routine"  = intersect(c(rou), names(train_df)),
+    "Research" = intersect(c(res), names(train_df)),
+    "Both"     = intersect(c(union(rou, res)), names(train_df))
+  )
+  
+  print(predictors)
+  
+  frm <- as.formula(paste0("Hist(time, status) ~ ", paste(predictors, 
+                                                          collapse = " + ")))
+  fit_models[[nm]] <- riskRegression::FGR(frm, data = train_df, cause = 1)
+
+  
+}
+
+# test prediction
+test_df <- cbind.data.frame(
+  time   = ftime_test,
+  status = fstatus_test,
+  as.data.frame(X_test)
+)
+#test_df <- test_df[, !(names(test_df) %in% drop_vars)]
+
+# evaluation
+times_eval <- c(36, 60) 
+
+scores <- riskRegression::Score(
+  object  = fit_models,
+  formula = Hist(time, status) ~ 1,
+  data    = test_df,
+  times   = times_eval,
+  metrics = "Brier",
+  cause   = 1,
+  summary = "ibs"
+)
+
+scores$Brier
+
+riskRegression::plotBrier(scores)
+
+```
+
+```{r}
+df_brier <- scores$Brier$score
+
+ggplot(df_brier, aes(x = factor(times), y = Brier, color = model, group = model)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 2) +
+  geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.15) +
+  scale_y_continuous(name = "Brier score ", expand = expansion(mult = c(0, 0.05))) +
+  scale_x_discrete(name = "Time (months)") +
+  theme_minimal(base_size = 11) +
+  theme(
+    legend.title = element_blank(),
+    panel.grid.minor = element_blank()
+  ) +
+  labs(title = "Brier score comparison across models")
+
+```
+
+
+```{r}
+tidy_fg_hr <- function(fg_obj, model_name = "") {
+  # accept FGR (wraps cmprsk::crr) or crr directly
+  crr <- if (inherits(fg_obj, "FGR")) {
+    if (!is.null(fg_obj$crrfit)) fg_obj$crrfit else fg_obj$crrFit
+  } else fg_obj
+  stopifnot(inherits(crr, "crr"))
+
+  s   <- summary(crr)
+  tab <- as.data.frame(s$coef)
+  colnames(tab) <- make.names(colnames(tab), unique = TRUE)  # coef, exp.coef., se.coef., z, p (or p.value)
+
+  # robust p-value pick
+  pcol <- intersect(c("p","p.value","Pr..>.z."), colnames(tab))
+  pvec <- if (length(pcol)) tab[[pcol[1]]] else NA_real_
+
+  out <- data.frame(
+    term      = rownames(tab),
+    estimate  = tab[["exp.coef."]],
+    conf.low  = exp(tab[["coef"]] - 1.96 * tab[["se.coef."]]),
+    conf.high = exp(tab[["coef"]] + 1.96 * tab[["se.coef."]]),
+    p.value   = pvec,
+    model     = model_name,
+    row.names = NULL,
+    check.names = FALSE
+  )
+  out$sig <- factor(ifelse(is.na(out$p.value), "NA",
+                           ifelse(out$p.value < 0.05, "p<0.05", "ns")),
+                    levels = c("p<0.05","ns","NA"))
+  out
+}
+```
+
+```{r}
+models3 <- list(
+  Routine  = fit_models[["Routine"]],
+  Research = fit_models[["Research"]],
+  Both     = fit_models[["Both"]]
+)
+HR_all <- bind_rows(lapply(names(models3), function(nm) tidy_fg_hr(models3[[nm]], nm)))
+
+HR_all <- HR_all %>%
+  group_by(model) %>%
+  mutate(term_f = factor(term, levels = term[order(estimate)])) %>%
+  ungroup()
+
+ggplot(HR_all, aes(x = estimate, y = term_f, color = sig)) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "grey60") +
+  geom_pointrange(aes(xmin = conf.low, xmax = conf.high), na.rm = TRUE) +
+  scale_x_log10() +
+  scale_color_manual(values = c("p<0.05" = "#D55E00", "ns" = "#555555", "NA" = "#AAAAAA"),
+                     name = "Significance") +
+  labs(x = "Hazard Ratio (log scale)", y = NULL, title = "Fine–Gray (Cause 1): HRs by model") +
+  facet_wrap(~ model, scales = "free_y") +
+  theme_bw(12) +
+  theme(legend.position = "right")
+```
+
