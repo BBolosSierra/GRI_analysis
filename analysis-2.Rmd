@@ -27,7 +27,7 @@ rownames(df) = df$TMA_order
 
 df = df[, !(names(df) %in% c("TMA_order"))]
 
-df = df[, !(names(df)) %in% c("X")]
+df = df[, !(names(df)) %in% c("X", "Peritoneal_Invasion")]
 
 ```
 
@@ -36,8 +36,8 @@ colnames(df)
 ```
 
 ```{r}
-binary <- c('Emergency_Surgery', 'Sex', 'Tumour_Budding', 'Margin_Invasion',
-       'Peritoneal_Invasion', 'IL6R_AK_186_64', 'ZEB1_Nuclear',
+binary <- c('Emergency_Surgery', 'Sex', 'Tumour_Budding', 'Margin_Invasion','IL6R_AK_186_64', 'ZEB1_Nuclear',
+            # 'Peritoneal_Invasion',
        'Twist_Cytoplasmic', 'Twist_Nuclear', 'Snail_Cytoplasmic',
        'Snail_Nuclear', 'SOX9_Cytoplasmic', 'SOX9_Nuclear', 'ZEB1_Cytoplasmic', 'BudCohort_ZEB1_Nuclear',
        'IL17RA_Presence', 'BRAF', 'KRAS', 'NRAS')
