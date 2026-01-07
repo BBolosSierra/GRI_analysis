@@ -819,7 +819,6 @@ imp_train$method
 ```
 
 
-
 ```{r}
 library(ggmice)
 #gmice(df, aes(IL17RA_Presence, Age)) +
@@ -1234,8 +1233,8 @@ ggplot(HR_all, aes(x = estimate, y = term_key, color = sig)) +
     axis.text.y = element_markdown()
   )
 ```
-#### try with other categorization: 
 
+#### try with other categorization: 
 
 ```{r}
 meta <- read.csv("data/GRI_preprocess-1-meta.csv", stringsAsFactors = FALSE)
@@ -1413,3 +1412,6 @@ ggplot(HR_all, aes(x = estimate, y = term_key, color = sig)) +
     axis.text.y = element_markdown()
   )
 ```
+
+
+

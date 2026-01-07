@@ -1,0 +1,226 @@
+---
+title: "analysis-3"
+output: html_document
+---
+
+### Penalised Fine and grey 
+
+```{r}
+library(dplyr)
+library(tidyr)
+
+library(survival)
+library(survminer)
+library(ggplot2)
+
+library(tidycmprsk)
+library(ggsurvfit)
+library(cmprsk)
+library(ggsurvfit)
+
+library(recipes)
+library(rsample)
+library(broom)
+library(mice)
+
+```
+
+```{r}
+
+df = read.csv("data/GRI_preprocess-2.csv", na.strings = "")
+
+rownames(df) = df$TMA_order
+
+df = df[, !(names(df) %in% c("TMA_order"))]
+
+df = df[, !(names(df)) %in% c("X", "Peritoneal_Invasion")]
+
+```
+
+```{r}
+colnames(df)
+```
+
+
+```{r}
+binary <- c('Emergency_Surgery', 'Sex', 'Tumour_Budding', 'Margin_Invasion','IL6R_AK_186_64', 'ZEB1_Nuclear',
+            # 'Peritoneal_Invasion',
+       'Twist_Cytoplasmic', 'Twist_Nuclear', 'Snail_Cytoplasmic',
+       'Snail_Nuclear', 'SOX9_Cytoplasmic', 'SOX9_Nuclear', 'ZEB1_Cytoplasmic', 'BudCohort_ZEB1_Nuclear',
+       'IL17RA_Presence', 'BRAF', 'KRAS', 'NRAS')
+
+```
+
+```{r}
+cat <- c('MMR_Status', 'Tumour_Location', 'T_Stage', 'N_Stage',
+       'Histological_Grade', 'Elastica_Venous_Invasion')
+```
+
+```{r}
+# transform to factors
+df[binary] <- lapply(df[binary], as.factor)
+df[cat] <- lapply(df[cat], as.factor)
+```
+
+```{r}
+length(colnames(df))
+```
+
+```{r}
+set.seed(123)
+
+rownames(df) <- df$TMA_Order
+
+df <- df[, !(names(df) %in% c("TMA_Order"))]
+
+time_col   <- "Time"
+status_col <- "Outcome"
+
+predictors <- setdiff(names(df), c(time_col, status_col))
+
+predictors
+```
+
+```{r}
+length(predictors)
+```
+
+### Split
+
+```{r}
+set.seed(43)
+
+split <- initial_split(df, prop = 0.8, strata = status_col)
+train <- training(split)
+test  <- testing(split)
+
+train_pred <- train[, predictors, drop = FALSE]
+test_pred  <- test[,  predictors, drop = FALSE]
+
+meth  <- make.method(train_pred)
+predM <- make.predictorMatrix(train_pred)
+
+imp_train <- mice(
+  train_pred,
+  m = 1,
+  method = meth,
+  predictorMatrix = predM,
+  maxit = 100,
+  seed = 12,
+  printFlag = FALSE
+)
+
+train_pred_imp <- complete(imp_train, 1)
+
+imp_test <- mice.mids(imp_train, newdata = test_pred)
+test_pred_imp <- complete(imp_test, 1)
+
+# adding time and outcome
+train_imp <- bind_cols(train[, setdiff(names(train), predictors), 
+                             drop = FALSE],
+                       train_pred_imp)
+
+test_imp  <- bind_cols(test[, setdiff(names(test), predictors), 
+                            drop = FALSE],
+                       test_pred_imp)
+
+rx <- recipe(~ ., data = train_imp) %>%
+  # update as outcome to avoid normalization of time
+  update_role(all_of(time_col), new_role = "outcome") %>%
+  update_role(all_of(status_col), new_role = "outcome") %>%
+  update_role(all_of(predictors), new_role = "predictor") %>%
+  step_zv(all_predictors()) %>%
+  step_normalize(all_numeric_predictors(), -all_outcomes())
+
+rx_prep <- prep(rx, training = train_imp, verbose = FALSE)
+
+X_train <- bake(rx_prep, new_data = train_imp)
+X_test  <- bake(rx_prep, new_data = test_imp)
+
+ftime_train   <- train_imp[[time_col]]
+fstatus_train <- train_imp[[status_col]]
+
+ftime_test    <- test_imp[[time_col]]
+fstatus_test  <- test_imp[[status_col]]
+```
+
+
+## Penalised Fine and Grey:
+
+```{r}
+library("fastcmprsk")
+```
+```{r}
+causes <- sort(setdiff(unique(fstatus_train), 0))
+```
+
+```{r}
+library(fastcmprsk)
+
+train_df <- as.data.frame(X_train)
+predictors <- setdiff(names(train_df), c("Time", "Outcome"))
+lambda_seq <- exp(seq(log(1), log(1e-4), length.out = 50)) 
+
+fit_fg_pen <- lapply(causes, function(k) {
+
+  frm_k <- as.formula(
+    paste0("Crisk(Time, Outcome, cencode=0, failcode=", k, ") ~ ",
+           paste(predictors, collapse=" + "))
+  )
+
+  fit <- fastCrrp(
+    formula = frm_k,
+    data    = train_df,
+    penalty = "LASSO",
+    nlambda = 50,
+    #lambda.min.ratio = 0.1,
+    lambda = lambda_seq,
+    standardize = TRUE
+  )
+  
+  # does not generate the names of the variables directly
+  Xmm <- model.matrix(delete.response(terms(frm_k)), data = train_df)
+  if ("(Intercept)" %in% colnames(Xmm)) Xmm <- Xmm[, colnames(Xmm) != "(Intercept)", drop=FALSE]
+
+  stopifnot(nrow(fit$coef) == ncol(Xmm))
+  rownames(fit$coef) <- colnames(Xmm)
+
+  fit
+})
+
+names(fit_fg_pen) <- paste0("FGpen_cause_", causes)
+
+```
+
+```{r}
+fit_pen1 <- fit_fg_pen[["FGpen_cause_1"]]
+
+B <- fit_pen1$coef
+
+colSums(abs(B) < 1e-10)
+
+```
+
+Next questions is which lambda to use
+
+```{r}
+df  <- colSums(abs(B) > 0)
+aic <- -2 * fit_pen1$logLik + 2 * df
+best_idx <- which.min(aic)
+```
+```{r}
+aic
+```
+
+
+```{r}
+AIC(fit_pen1)
+```
+```{r}
+beta_hat <- fit_pen1$coef[, best_idx]
+lambda_hat <- fit_pen1$lambda.path[best_idx]
+```
+```{r}
+beta_hat
+```
+
